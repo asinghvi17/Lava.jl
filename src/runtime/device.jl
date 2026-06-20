@@ -374,6 +374,12 @@ const ENABLED_OPTIONAL_FEATURES = Set{Symbol}()
 # pointers). NVIDIA/AMD keep their original codegen so this never regresses them.
 const IS_MOLTENVK = Ref(false)
 
+# Whether the device-scope Vulkan memory model feature is enabled (set in
+# init_vulkan! from PhysicalDeviceVulkanMemoryModelFeatures). When true, the SPIR-V
+# emitter may request Scope.Device on atomics that need device-wide ordering (the
+# cross-workgroup BVH refit on MoltenVK). When false, it stays on Scope.QueueFamily.
+const VK_MEMORY_MODEL_DEVICE_SCOPE = Ref(false)
+
 """
     has_device_feature(feature::Symbol) -> Bool
 
@@ -689,6 +695,22 @@ function init_vulkan!()
         true,   # variable_pointers_storage_buffer
         true,   # variable_pointers
     )
+    # Device-scope Vulkan memory model: needed on MoltenVK for the cross-workgroup
+    # bottom-up BVH refit (atomic visitor-counter + non-atomic AABB read/write).
+    # QueueFamily scope ≈ Device on NVIDIA/AMD single-queue, but on Metal it does NOT
+    # give device-wide visibility of the sibling's non-atomic write → stale child AABBs
+    # → pruned subtrees. Enable the feature where the device supports it so the emitter
+    # can request Device scope. (No-op on devices that already treat them equivalently.)
+    want_mm_device_scope = let supported = false
+        try
+            f2 = Vulkan.get_physical_device_features_2(phys_dev, Vulkan.PhysicalDeviceVulkanMemoryModelFeatures)
+            supported = f2.next.vulkan_memory_model_device_scope
+        catch
+            supported = false
+        end
+        supported
+    end
+    VK_MEMORY_MODEL_DEVICE_SCOPE[] = want_mm_device_scope
     # Vulkan 1.2 features: BDA, VulkanMemoryModel, shaderInt8, scalarBlockLayout
     vulkan12_features = Vulkan._PhysicalDeviceVulkan12Features(
         false,  # sampler_mirror_clamp_to_edge
@@ -733,7 +755,7 @@ function init_vulkan!()
         false,  # buffer_device_address_capture_replay
         false,  # buffer_device_address_multi_device
         true,   # vulkan_memory_model  ← REQUIRED (QueueFamily scope)
-        false,  # vulkan_memory_model_device_scope
+        want_mm_device_scope,  # vulkan_memory_model_device_scope (Device-scope atomics on MoltenVK)
         false,  # vulkan_memory_model_availability_visibility_chains
         false,  # shader_output_viewport_index
         false,  # shader_output_layer

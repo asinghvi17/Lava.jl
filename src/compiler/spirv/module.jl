@@ -269,6 +269,7 @@ module Cap
     const Int16                         = UInt32(22)
     const StorageBuffer16BitAccess      = UInt32(4433)
     const VulkanMemoryModel             = UInt32(5345)
+    const VulkanMemoryModelDeviceScope  = UInt32(5346)
     const PhysicalStorageBufferAddresses = UInt32(5347)
     const VariablePointers              = UInt32(4442)
     const VariablePointersStorageBuffer = UInt32(4441)

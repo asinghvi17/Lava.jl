@@ -7261,6 +7261,19 @@ invocations. Without these, even seq_cst atomics provide only atomicity
 — which breaks cross-workgroup patterns like BVH refit where Thread A
 writes node data, atomics on a flag, and Thread B reads via the flag.
 """
+# atomic_device_scope() -> raw Scope enum value (caller wraps with emit_constant_u32!).
+# On MoltenVK with the device-scope Vulkan memory model available, return Scope.Device
+# (required for cross-workgroup visibility of the non-atomic writes the BVH refit
+# depends on — Metal does not honor QueueFamily for that). Otherwise Scope.QueueFamily
+# (NVIDIA/AMD: equivalent, and avoids the VulkanMemoryModelDeviceScope capability).
+@inline function atomic_device_scope()
+    if is_moltenvk() && VK_MEMORY_MODEL_DEVICE_SCOPE[]
+        return Scope.Device
+    else
+        return Scope.QueueFamily
+    end
+end
+
 function atomic_mem_semantics(inst::LLVM.Instruction, ptr::LLVM.Value)::UInt32
     ord = LLVM.ordering(inst)
 
@@ -7314,9 +7327,16 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
     result_ty = map_type!(state.type_ctx, result_llvm_ty)
     result_id = fresh_id!(state.mod)
 
-    # Determine scope: QueueFamily is equivalent to Device for single-queue Vulkan
-    # and doesn't require VulkanMemoryModelDeviceScopeKHR capability
-    scope_id = emit_constant_u32!(state.mod, Scope.QueueFamily)
+    # Scope: QueueFamily ≈ Device for single-queue Vulkan on NVIDIA/AMD (and avoids
+    # the VulkanMemoryModelDeviceScope capability). But on MoltenVK/Metal, QueueFamily
+    # does NOT give device-wide visibility of a *non-atomic* write made by a thread in
+    # another workgroup — which silently breaks the cross-workgroup BVH refit (atomic
+    # visitor-counter gating non-atomic AABB read/write) → stale child AABBs → pruned
+    # subtrees. When the device-scope memory model is available, use Device scope so the
+    # release/acquire + MakeAvailable/MakeVisible actually order the non-atomic accesses.
+    atomic_scope = atomic_device_scope()
+    atomic_scope == Scope.Device && require_capability!(state.mod, Cap.VulkanMemoryModelDeviceScope)
+    scope_id = emit_constant_u32!(state.mod, atomic_scope)
 
     # Memory semantics — derived from LLVM ordering + pointer storage class
     mem_sem_id = emit_constant_u32!(state.mod, atomic_mem_semantics(inst, ptr))
@@ -7412,11 +7432,43 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
         ptr_id = emit_psb_atomic_lvalue_ptr!(state, ptr_id, result_ty)
     end
 
+    # MoltenVK: the Vulkan-memory-model MakeAvailable/MakeVisible bits on the atomic
+    # itself are NOT translated by SPIRV-Cross into Metal device memory fences, so a
+    # non-atomic write published before this atomic (and a non-atomic read after it)
+    # is not actually ordered across threadgroups — which silently corrupts the
+    # cross-workgroup BVH refit. Bracket the atomic with explicit Device-scope
+    # OpMemoryBarriers (which SPIRV-Cross DOES lower to `atomic_thread_fence(
+    # mem_flags::mem_device, …)`): the pre-barrier publishes prior writes (release),
+    # the post-barrier makes subsequent reads visible (acquire). NVIDIA/AMD don't need
+    # this (their atomic semantics already order surrounding accesses).
+    bracket_barrier = is_moltenvk() && atomic_scope == Scope.Device &&
+                      sc == SC.PhysicalStorageBuffer
+    if bracket_barrier
+        emit_device_memory_barrier!(state)
+    end
+
     # Format: OpAtomic* result_type result_id pointer scope mem_semantics value
     encode_instruction!(state.mod.functions, opcode,
         result_ty, result_id, ptr_id, scope_id, mem_sem_id, val_id)
 
+    if bracket_barrier
+        emit_device_memory_barrier!(state)
+    end
+
     state.value_map[inst] = result_id
+end
+
+# Emit `OpMemoryBarrier Device, AcquireRelease|UniformMemory|MakeAvailable|MakeVisible`.
+# Used on MoltenVK to force a Metal device memory fence around BVH-refit-class atomics,
+# since SPIRV-Cross does not honor the atomic's own availability/visibility bits.
+function emit_device_memory_barrier!(state::SPIRVEmitterState)
+    require_capability!(state.mod, Cap.VulkanMemoryModelDeviceScope)
+    scope = emit_constant_u32!(state.mod, Scope.Device)
+    sem = emit_constant_u32!(state.mod,
+        MemSem.AcquireRelease | MemSem.UniformMemory |
+        MemSem.MakeAvailableKHR | MemSem.MakeVisibleKHR)
+    encode_instruction!(state.mod.functions, Op.OpMemoryBarrier, scope, sem)
+    return nothing
 end
 
 # Helper: check if an integer type is signed (for min/max dispatch)
@@ -7445,8 +7497,10 @@ function emit_cmpxchg!(state::SPIRVEmitterState, inst::LLVM.AtomicCmpXchgInst)
         require_capability!(state.mod, Cap.Int64Atomics)
     end
 
-    # Scope — QueueFamily (equivalent to Device for single-queue, no extra capability)
-    scope_id = emit_constant_u32!(state.mod, Scope.QueueFamily)
+    # Scope — Device on MoltenVK (cross-workgroup visibility), else QueueFamily.
+    cas_scope = atomic_device_scope()
+    cas_scope == Scope.Device && require_capability!(state.mod, Cap.VulkanMemoryModelDeviceScope)
+    scope_id = emit_constant_u32!(state.mod, cas_scope)
     # Memory semantics — derived from LLVM ordering + pointer storage class
     mem_sem = atomic_mem_semantics(inst, ptr)
     mem_sem_equal_id = emit_constant_u32!(state.mod, mem_sem)
