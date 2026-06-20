@@ -51,6 +51,7 @@ module Op
     const OpVariable                = UInt16(59)
     const OpLoad                    = UInt16(61)
     const OpStore                   = UInt16(62)
+    const OpCopyObject              = UInt16(83)
     const OpAccessChain             = UInt16(65)
     const OpInBoundsAccessChain     = UInt16(66)
     const OpPtrAccessChain          = UInt16(67)
@@ -1033,6 +1034,242 @@ function fold_convert_roundtrips!(mod::SPIRVModule)
 end
 
 """
+    lower_psb_addr_casts_moltenvk!(mod::SPIRVModule)
+
+MoltenVK-only peephole that rewrites `OpConvertPtrToU(OpAccessChain(...))` into
+integer address arithmetic from the access chain's *root* BDA pointer.
+
+Problem: Lava's BDA address lowering takes the integer address of a PSB pointer
+with `OpConvertPtrToU`. When that pointer is an `OpAccessChain` into a PSB struct
+member / array element, MoltenVK's SPIRV-Cross→MSL backend renders
+`OpConvertPtrToU(OpAccessChain(p, m))` as `reinterpret_cast<ulong>(p->_m)` — the
+member *value* (a `uint` / `uint[2]`) — and `value → ulong` via `reinterpret_cast`
+is illegal MSL ("reinterpret_cast from 'uint' to 'ulong' is not allowed"). A bare
+`OpConvertPtrToU` of a genuine pointer (function arg, `OpVariable`, `OpLoad`,
+`OpPhi`, or an `OpConvertUToPtr` result) is fine — only the access-chain form is
+mistranslated.
+
+Fix: replace the address-as-int of an access chain with
+`addr_int(base) + Σ(index × stride)` where stride is the member `Offset`
+(struct) or `ArrayStride` (array) from the module decorations, recursing on the
+chain's base until a legal root:
+  - `OpConvertUToPtr(int)` → `int`
+  - genuine pointer value (load / phi / variable / arg) → `OpConvertPtrToU(ptr)`
+The typed `OpAccessChain` and its load/store consumers are left untouched; only the
+`OpConvertPtrToU` consumer is rewritten (turned into `OpCopyObject` of the int).
+
+Gated on MoltenVK (`is_moltenvk()`): NVIDIA/AMD keep the original codegen
+byte-for-byte, so there is no regression risk. Vendor-neutral correctness is
+preserved because the rewrite computes the identical byte address.
+"""
+function lower_psb_addr_casts_moltenvk!(mod::SPIRVModule)
+    words = mod.functions
+    n = length(words)
+    n == 0 && return nothing
+
+    # ── Build type / decoration / constant tables from the whole module ──
+    tc = mod.types_constants
+    ptr_pointee   = Dict{UInt32, UInt32}()          # OpTypePointer result → pointee type
+    arr_elem      = Dict{UInt32, UInt32}()          # OpTypeArray result → element type
+    struct_mems   = Dict{UInt32, Vector{UInt32}}()  # OpTypeStruct result → member types
+    const_uint    = Dict{UInt32, UInt64}()          # OpConstant (int) result → value
+    let i = 1, m = length(tc)
+        while i <= m
+            hdr = tc[i]; len = Int(hdr >> 16); op = UInt16(hdr & 0xFFFF)
+            len == 0 && break
+            if op == Op.OpTypePointer && len == 4
+                ptr_pointee[tc[i+1]] = tc[i+3]          # result, storage, pointee
+            elseif op == Op.OpTypeArray && len == 4
+                arr_elem[tc[i+1]] = tc[i+2]             # result, elem, length
+            elseif op == Op.OpTypeStruct && len >= 2
+                struct_mems[tc[i+1]] = collect(tc[(i+2):(i+len-1)])
+            elseif op == Op.OpConstant && len >= 4
+                # result type at i+1, result id at i+2, literal at i+3 (low word).
+                # Only single-word (≤32-bit) literals are used as access-chain indices.
+                len == 4 && (const_uint[tc[i+2]] = UInt64(tc[i+3]))
+            end
+            i += len
+        end
+    end
+    # member byte offsets and array strides
+    member_offset = Dict{Tuple{UInt32,UInt32}, UInt32}()
+    array_stride  = Dict{UInt32, UInt32}()
+    let a = mod.annotations, m = length(a), i = 1
+        while i <= m
+            hdr = a[i]; len = Int(hdr >> 16); op = UInt16(hdr & 0xFFFF)
+            len == 0 && break
+            if op == Op.OpMemberDecorate && len >= 5 && a[i+3] == Dec.Offset
+                member_offset[(a[i+1], a[i+2])] = a[i+4]
+            elseif op == Op.OpDecorate && len >= 4 && a[i+2] == Dec.ArrayStride
+                array_stride[a[i+1]] = a[i+3]
+            end
+            i += len
+        end
+    end
+
+    # ── Instruction defs in the function stream: id → (opcode, [operands], start) ──
+    # operands includes the result type as operands[1] for typed instructions.
+    def_op   = Dict{UInt32, UInt16}()
+    def_ops  = Dict{UInt32, Vector{UInt32}}()
+    let i = 1
+        while i <= n
+            hdr = words[i]; len = Int(hdr >> 16); op = UInt16(hdr & 0xFFFF)
+            len == 0 && break
+            # result id position: for OpConvertPtrToU/UToPtr/AccessChain/Load/Phi/etc.
+            # the layout is [hdr, resultType, resultId, operands...]; CopyObject same.
+            if len >= 3 && op in (Op.OpConvertPtrToU, Op.OpConvertUToPtr, Op.OpAccessChain,
+                                  Op.OpInBoundsAccessChain, Op.OpLoad, Op.OpPhi, Op.OpCopyObject,
+                                  Op.OpIAdd, Op.OpIMul, Op.OpUConvert, Op.OpSConvert,
+                                  Op.OpPtrAccessChain, Op.OpInBoundsPtrAccessChain)
+                rid = words[i+2]
+                def_op[rid] = op
+                # [resultType, operands...] — EXCLUDE the result id at i+2, so
+                # ops[1]=resultType, ops[2]=first operand (base for access chains).
+                def_ops[rid] = vcat(words[i+1], collect(words[(i+3):(i+len-1)]))
+            end
+            i += len
+        end
+    end
+
+    # Comprehensive result-type map (id → result type id) over EVERY typed
+    # result-producing instruction in global_vars + functions. The access-chain
+    # walk needs a base pointer's result type even when the base is an `OpVariable`
+    # (in global_vars) or another op outside the small def_op whitelist.
+    restype = Dict{UInt32, UInt32}()
+    for sec in (mod.global_vars, mod.functions)
+        i = 1; m = length(sec)
+        while i <= m
+            hdr = sec[i]; len = Int(hdr >> 16); op = UInt16(hdr & 0xFFFF)
+            len == 0 && break
+            # Result-producing ops carry [resultType@+1, resultId@+2, ...]. Exclude the
+            # handful of len>=3 ops that are NOT (type/const decls live elsewhere;
+            # in these sections the exceptions are OpStore/OpCopyMemory etc. which have
+            # no result — they're harmless to skip because we only ever look up pointer
+            # producers, never those).
+            if len >= 3 && !(op in (Op.OpStore, Op.OpDecorate, Op.OpMemberDecorate,
+                                    Op.OpBranchConditional, Op.OpBranch))
+                restype[sec[i+2]] = sec[i+1]
+            end
+            i += len
+        end
+    end
+
+    u64_ty = emit_type_int!(mod, UInt32(64), UInt32(0))
+    ulong_const(v::Integer) = emit_constant_u64!(mod, UInt64(v % UInt64))
+
+    # Emit buffer for new instructions placed at the cast site; returns the int SSA id
+    # for the byte address of pointer `pid`, or `nothing` if it cannot be lowered.
+    # `buf` accumulates encoded instruction words to insert before the cast.
+    function addr_int(pid::UInt32, buf::Vector{UInt32}, depth::Int)
+        depth > 64 && return nothing
+        op = get(def_op, pid, UInt16(0))
+        if op == Op.OpConvertUToPtr
+            return def_ops[pid][2]   # [resultType, intSrc]
+        elseif op == Op.OpAccessChain || op == Op.OpInBoundsAccessChain
+            ops = def_ops[pid]       # [resultType, base, idx...]
+            base = ops[2]
+            base_int = addr_int(base, buf, depth+1)
+            base_int === nothing && return nothing
+            base_rt = get(restype, base, UInt32(0))   # base pointer's result type
+            base_rt == 0 && return nothing
+            cur_ty = get(ptr_pointee, base_rt, UInt32(0))  # base's pointee type
+            cur_ty == 0 && return nothing
+            total = base_int
+            const_off = 0
+            for k in 3:length(ops)
+                idx = ops[k]
+                if haskey(struct_mems, cur_ty)
+                    haskey(const_uint, idx) || return nothing  # struct index must be constant
+                    mi = UInt32(const_uint[idx])
+                    const_off += Int(get(member_offset, (cur_ty, mi), UInt32(0)))
+                    mems = struct_mems[cur_ty]
+                    mi+1 <= length(mems) || return nothing
+                    cur_ty = mems[mi+1]
+                elseif haskey(arr_elem, cur_ty)
+                    stride = get(array_stride, cur_ty, UInt32(0))
+                    stride == 0 && return nothing
+                    if haskey(const_uint, idx)
+                        const_off += Int(const_uint[idx]) * Int(stride)
+                    else
+                        # dynamic: total += (u64)idx * stride
+                        iu = fresh_id!(mod)
+                        append!(buf, _enc(Op.OpUConvert, u64_ty, iu, idx))
+                        pr = fresh_id!(mod); sc = ulong_const(stride)
+                        append!(buf, _enc(Op.OpIMul, u64_ty, pr, iu, sc))
+                        nt = fresh_id!(mod)
+                        append!(buf, _enc(Op.OpIAdd, u64_ty, nt, total, pr))
+                        total = nt
+                    end
+                    cur_ty = arr_elem[cur_ty]
+                else
+                    return nothing  # unsupported pointee (not struct/array) — leave cast as-is
+                end
+            end
+            if const_off != 0
+                oc = ulong_const(const_off); nt = fresh_id!(mod)
+                append!(buf, _enc(Op.OpIAdd, u64_ty, nt, total, oc))
+                total = nt
+            end
+            return total
+        else
+            # Genuine pointer value (arg / OpVariable / OpLoad / OpPhi / unknown):
+            # OpConvertPtrToU on it is legal MSL. Emit it once.
+            cu = fresh_id!(mod)
+            append!(buf, _enc(Op.OpConvertPtrToU, u64_ty, cu, pid))
+            return cu
+        end
+    end
+
+    # ── Find OpConvertPtrToU(access-chain) sites; lower them ──
+    # site start index → (result_id, Vector of new instruction words, int_id)
+    rewrites = Dict{Int, Tuple{UInt32, Vector{UInt32}, UInt32}}()
+    let i = 1
+        while i <= n
+            hdr = words[i]; len = Int(hdr >> 16); op = UInt16(hdr & 0xFFFF)
+            len == 0 && break
+            if op == Op.OpConvertPtrToU && len == 4
+                operand = words[i+3]
+                oop = get(def_op, operand, UInt16(0))
+                if oop == Op.OpAccessChain || oop == Op.OpInBoundsAccessChain
+                    buf = UInt32[]
+                    ai = addr_int(operand, buf, 0)
+                    # Only rewrite when the address could be fully lowered to integer
+                    # arithmetic from a legal root; otherwise leave the cast untouched.
+                    ai === nothing || (rewrites[i] = (words[i+2], buf, ai))
+                end
+            end
+            i += len
+        end
+    end
+    isempty(rewrites) && return nothing
+
+    # ── Rebuild the function stream, splicing new instrs + OpCopyObject ──
+    out = UInt32[]; sizehint!(out, n + 8*length(rewrites))
+    let i = 1
+        while i <= n
+            hdr = words[i]; len = Int(hdr >> 16)
+            len == 0 && (append!(out, @view words[i:end]); break)
+            if haskey(rewrites, i)
+                res, buf, ai = rewrites[i]
+                append!(out, buf)                                   # address arithmetic
+                append!(out, _enc(Op.OpCopyObject, u64_ty, res, ai)) # res ← int (alias)
+            else
+                append!(out, @view words[i:(i+len-1)])
+            end
+            i += len
+        end
+    end
+    mod.functions = out
+    return nothing
+end
+
+# Encode one SPIR-V instruction into a word vector: (wordCount<<16)|opcode, operands...
+@inline function _enc(opcode::UInt16, operands::UInt32...)
+    wc = UInt32(1 + length(operands))
+    return UInt32[(wc << 16) | UInt32(opcode), operands...]
+end
+
+"""
     serialize(mod::SPIRVModule) -> Vector{UInt8}
 
 Serialize the SPIR-V module to a binary blob ready for spirv-val or VkShaderModule.
@@ -1040,6 +1277,11 @@ Serialize the SPIR-V module to a binary blob ready for spirv-val or VkShaderModu
 function serialize(mod::SPIRVModule)
     # Fold ptr↔int round-trips that MoltenVK's MSL backend mistranslates (and that
     # are harmless on other backends). Safe no-op when none are present.
+    # MoltenVK only: lower OpConvertPtrToU(OpAccessChain) → integer address from the
+    # chain's root, which SPIRV-Cross→MSL otherwise mistranslates as a value cast.
+    # Run BEFORE the round-trip fold (the fold's OpConvertUToPtr bases are exactly the
+    # legal roots this pass recurses to). Gated so NVIDIA/AMD codegen is unchanged.
+    is_moltenvk() && lower_psb_addr_casts_moltenvk!(mod)
     fold_convert_roundtrips!(mod)
 
     # Compute total words
