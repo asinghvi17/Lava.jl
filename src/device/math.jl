@@ -320,6 +320,32 @@ end
     Float16(sqrt(muladd(re, re, im * im)))
 end
 
+# ── ComplexF32 division / inverse without Float64 widening ──
+# Base.:/(::Complex{<:Union{Float16,Float32}}, ...) and Base.inv widen to Float64
+# internally (complex.jl `widen(z)`), which is illegal on devices without
+# shader_float_64 (MoltenVK) — GPUCompiler reports "unsupported use of double
+# value" from the Conductor/Fresnel complex math. Compute entirely in Float32.
+# (Same Float32-only precision tradeoff as abs(ComplexF32) above.)
+@lava_device_override @inline function Base.:/(z::ComplexF32, w::ComplexF32)
+    a = real(z); b = imag(z); c = real(w); d = imag(w)
+    mag = 1.0f0 / muladd(c, c, d * d)
+    Complex(muladd(a, c, b * d) * mag, muladd(b, c, -a * d) * mag)
+end
+
+@lava_device_override @inline function Base.inv(w::ComplexF32)
+    c = real(w); d = imag(w)
+    mag = 1.0f0 / muladd(c, c, d * d)
+    Complex(c * mag, -d * mag)
+end
+
+# Complex/real and real/complex divisions also widen in Base; keep Float32.
+@lava_device_override @inline Base.:/(z::ComplexF32, x::Float32) = Complex(real(z) / x, imag(z) / x)
+@lava_device_override @inline function Base.:/(x::Float32, w::ComplexF32)
+    c = real(w); d = imag(w)
+    mag = x / muladd(c, c, d * d)
+    Complex(c * mag, -d * mag)
+end
+
 # ── Functions that ccall libm and must be overridden to avoid GPU crashes ──
 
 @lava_device_override @inline Base.Math.log1p(x::Float32) = log(1.0f0 + x)
