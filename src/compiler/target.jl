@@ -241,7 +241,7 @@ end
     target = GPUCompiler.SPIRVCompilerTarget(;
         backend = :llvm,       # gives spirv64-unknown-unknown-unknown triple
         validate = false,      # we validate after our custom SPIR-V emitter
-        supports_fp64 = true,  # AMD RX 7900 XTX supports Float64
+        supports_fp64 = has_device_feature(:shader_float_64),
     )
     params = LavaCompilerParams(workgroup_size, enable_ray_query)
     GPUCompiler.CompilerConfig(target, params; kernel, name, always_inline)
