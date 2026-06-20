@@ -958,11 +958,90 @@ end
 # ================================================================
 
 """
+    fold_convert_roundtrips!(mod::SPIRVModule)
+
+Peephole over the function instruction stream that folds the identity
+`OpConvertPtrToU(OpConvertUToPtr(int)) → int`: when a pointer is produced by
+`OpConvertUToPtr` and immediately converted back with `OpConvertPtrToU`, replace
+all uses of the round-trip result with the original integer and drop the
+`OpConvertPtrToU`.
+
+Why: Lava's BDA address lowering emits these round-trips around every
+`base ± offset` step (1-based indexing, struct-base + member offset, chained
+GEPs). They are exact identities, but MoltenVK's SPIRV-Cross→MSL backend inlines
+the intermediate `OpConvertUToPtr` pointer into the `OpConvertPtrToU` and emits
+`reinterpret_cast<ulong>(<pointer-expr reduced to a value>)`, which Metal rejects
+("reinterpret_cast from '…' to 'ulong' is not allowed"). spirv-opt does NOT fold
+these (it is conservative about ptr↔int conversions). Removing an exact identity
+is correct on every backend, so this runs unconditionally.
+
+Operates only on `mod.functions`; constant-literal instructions are skipped so a
+constant whose value happens to equal a folded result id is never rewritten.
+"""
+function fold_convert_roundtrips!(mod::SPIRVModule)
+    words = mod.functions
+    n = length(words)
+    # Pass 1: map OpConvertUToPtr result id → its integer source id.
+    utop = Dict{UInt32, UInt32}()
+    i = 1
+    while i <= n
+        hdr = words[i]; len = Int(hdr >> 16); op = UInt16(hdr & 0xFFFF)
+        len == 0 && break  # malformed guard
+        if op == Op.OpConvertUToPtr && len == 4
+            utop[words[i+2]] = words[i+3]   # result ← operand(int)
+        end
+        i += len
+    end
+    isempty(utop) && return nothing
+    # Build replacement: OpConvertPtrToU(result-of-UToPtr) → that UToPtr's int src.
+    repl = Dict{UInt32, UInt32}()
+    del = Set{Int}()  # start indices of OpConvertPtrToU instructions to drop
+    i = 1
+    while i <= n
+        hdr = words[i]; len = Int(hdr >> 16); op = UInt16(hdr & 0xFFFF)
+        len == 0 && break
+        if op == Op.OpConvertPtrToU && len == 4 && haskey(utop, words[i+3])
+            repl[words[i+2]] = words[i+3] === words[i+2] ? words[i+3] : utop[words[i+3]]
+            push!(del, i)
+        end
+        i += len
+    end
+    isempty(repl) && return nothing
+    # Resolve transitively (a folded int source might itself be a folded result).
+    resolve(x) = (seen = Set{UInt32}(); while haskey(repl, x) && !(x in seen); push!(seen, x); x = repl[x]; end; x)
+    # Pass 2: rebuild, dropping deleted instrs and substituting operand IDs.
+    out = UInt32[]; sizehint!(out, n)
+    i = 1
+    while i <= n
+        hdr = words[i]; len = Int(hdr >> 16); op = UInt16(hdr & 0xFFFF)
+        len == 0 && (append!(out, @view words[i:end]); break)
+        if i in del
+            i += len; continue
+        end
+        push!(out, hdr)
+        # All operands here are IDs (mod.functions holds executable instructions,
+        # not OpConstant literals — those live in mod.types_constants). The repl
+        # keys are OpConvertPtrToU result IDs, so any operand matching one is a use.
+        for k in 1:(len-1)
+            w = words[i+k]
+            push!(out, haskey(repl, w) ? resolve(w) : w)
+        end
+        i += len
+    end
+    mod.functions = out
+    return nothing
+end
+
+"""
     serialize(mod::SPIRVModule) -> Vector{UInt8}
 
 Serialize the SPIR-V module to a binary blob ready for spirv-val or VkShaderModule.
 """
 function serialize(mod::SPIRVModule)
+    # Fold ptr↔int round-trips that MoltenVK's MSL backend mistranslates (and that
+    # are harmless on other backends). Safe no-op when none are present.
+    fold_convert_roundtrips!(mod)
+
     # Compute total words
     total_words = 5  # header
     for section in (mod.capabilities, mod.extensions, mod.ext_inst_imports,

@@ -367,6 +367,13 @@ const RESET_CALLBACKS = Function[]
 # Populated during init_vulkan!(), queried by compiler target and tests.
 const ENABLED_OPTIONAL_FEATURES = Set{Symbol}()
 
+# Whether the active device is MoltenVK (Vulkan-on-Metal, macOS/iOS). Set during
+# init_vulkan!() from the VK_KHR_portability_subset extension. The SPIR-V emitter
+# queries this to switch to MoltenVK-safe codegen for a few constructs that
+# SPIRV-Cross→MSL mistranslates (e.g. atomics on raw PhysicalStorageBuffer
+# pointers). NVIDIA/AMD keep their original codegen so this never regresses them.
+const IS_MOLTENVK = Ref(false)
+
 """
     has_device_feature(feature::Symbol) -> Bool
 
@@ -383,6 +390,21 @@ function has_device_feature(feature::Symbol)
     end
     vk_context()  # ensure initialized
     return feature in ENABLED_OPTIONAL_FEATURES
+end
+
+"""
+    is_moltenvk() -> Bool
+
+Whether the active Vulkan device is MoltenVK (Metal). Returns `false` during
+precompilation (so the pkgimage build never bakes a device-specific decision —
+the real value is set at device init and read at kernel-compile time).
+"""
+function is_moltenvk()
+    if ccall(:jl_generating_output, Cint, ()) != 0
+        return false
+    end
+    vk_context()  # ensure initialized
+    return IS_MOLTENVK[]
 end
 
 """
@@ -579,6 +601,11 @@ function init_vulkan!()
     phys_dev = pick_physical_device(phys_devs)
     props = Vulkan.get_physical_device_properties(phys_dev)
     dev_name = String(filter(!=('\0'), collect(props.device_name)))
+
+    # Detect MoltenVK (Vulkan-on-Metal). MoltenVK is a portability driver and
+    # always advertises VK_KHR_portability_subset; native NVIDIA/AMD do not.
+    # The SPIR-V emitter reads IS_MOLTENVK to pick MSL-safe codegen variants.
+    IS_MOLTENVK[] = has_extension(phys_dev, "VK_KHR_portability_subset")
 
     # Find queue family (prefer graphics+compute for graphics pipeline support)
     qf_idx = find_graphics_compute_queue_family(phys_dev)

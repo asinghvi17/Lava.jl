@@ -147,6 +147,9 @@ mutable struct SPIRVEmitterState
     # for PSB pointers cannot be bridged with OpBitcast — we record the emitted pointee here
     # and pick the select result type from it rather than from the (possibly newer) PTM.
     value_emitted_pointee::Dict{LLVM.Value, LLVM.LLVMType}
+    # MoltenVK atomic workaround: single-member PSB wrapper struct type IDs that
+    # have already had their Block/Offset decorations emitted (decorate once).
+    psb_atomic_wrapper_decorated::Set{UInt32}
 end
 
 function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
@@ -179,6 +182,7 @@ function SPIRVEmitterState(mod::SPIRVModule, type_ctx::SPIRVTypeContext)
         Dict{UInt32, LLVM.LLVMType}(),  # spirv_id_llvm_type
         Dict{UInt32, Tuple{UInt32, UInt32}}(),  # psb_access_chain
         Dict{LLVM.Value, LLVM.LLVMType}(),  # value_emitted_pointee
+        Set{UInt32}(),  # psb_atomic_wrapper_decorated
     )
 end
 
@@ -278,6 +282,45 @@ function emit_psb_ptr_reinterpret!(state::SPIRVEmitterState, target_ptr_ty_id::U
     result_id = fresh_id!(state.mod)
     encode_instruction!(state.mod.functions, Op.OpConvertUToPtr, target_ptr_ty_id, result_id, tmp_id)
     return result_id
+end
+
+"""
+    emit_psb_atomic_lvalue_ptr!(state, ptr_id, elem_spirv_ty) -> UInt32
+
+MoltenVK-only: turn a PhysicalStorageBuffer pointer-to-scalar (`ptr_id`, built by
+`OpConvertUToPtr` from BDA address arithmetic) into an *addressable* element
+pointer that SPIRV-Cross→MSL accepts as an atomic operand.
+
+SPIRV-Cross renders `OpAtomic*` on a raw `OpConvertUToPtr` pointer as
+`atomic_*((device atomic_T*)&(reinterpret_cast<device T*>(addr)))` — and `&` on a
+`reinterpret_cast` rvalue is illegal MSL ("cannot take the address of an rvalue").
+Routing the address through a one-member `Block` struct and an `OpAccessChain`
+makes SPIRV-Cross treat the member as an lvalue, so it emits a plain
+`reinterpret_cast<device atomic_T*>` with no `&`.
+
+Returns a new pointer ID of type `ptr<elem_spirv_ty, PhysicalStorageBuffer>` that
+addresses the same memory. NVIDIA/AMD never call this (they handle the raw form).
+"""
+function emit_psb_atomic_lvalue_ptr!(state::SPIRVEmitterState, ptr_id::UInt32,
+                                     elem_spirv_ty::UInt32)
+    # One-member struct { elem } with relaxed-storage-buffer layout (Offset 0).
+    wrapper_struct = emit_type_struct!(state.mod, UInt32[elem_spirv_ty])
+    if !(wrapper_struct in state.psb_atomic_wrapper_decorated)
+        emit_decorate!(state.mod, wrapper_struct, Dec.Block)
+        emit_member_decorate!(state.mod, wrapper_struct, UInt32(0), Dec.Offset, UInt32(0))
+        push!(state.psb_atomic_wrapper_decorated, wrapper_struct)
+    end
+    struct_ptr_ty = map_pointer_type!(state.type_ctx, wrapper_struct, SC.PhysicalStorageBuffer)
+    elem_ptr_ty   = map_pointer_type!(state.type_ctx, elem_spirv_ty, SC.PhysicalStorageBuffer)
+
+    # Reinterpret the incoming PSB pointer to ptr<struct,PSB>, then AccessChain
+    # member 0 → ptr<elem,PSB>. The reinterpret reuses the ConvertPtrToU/UToPtr
+    # roundtrip (single intermediate), which on MoltenVK collapses cleanly.
+    struct_ptr = emit_psb_ptr_reinterpret!(state, struct_ptr_ty, ptr_id)
+    zero_id = emit_constant_u32!(state.mod, UInt32(0))
+    ac_id = fresh_id!(state.mod)
+    encode_instruction!(state.mod.functions, Op.OpAccessChain, elem_ptr_ty, ac_id, struct_ptr, zero_id)
+    return ac_id
 end
 
 """
@@ -1207,8 +1250,16 @@ function emit_load!(state::SPIRVEmitterState, inst::LLVM.LoadInst)
                pointee_ty_ld isa LLVM.IntegerType && LLVM.width(pointee_ty_ld) == 64
                 psb_ptr_as_i64 = true
                 align = UInt32(8)
-            elseif pointee_ty_ld !== nothing && actual_load != pointee_ty_ld &&
+            elseif !did_drill_for_load && pointee_ty_ld !== nothing && actual_load != pointee_ty_ld &&
                !(actual_load isa LLVM.PointerType) && !(pointee_ty_ld isa LLVM.PointerType)
+                # `pointee_ty_ld` is the ORIGINAL pointer's pointee. When
+                # resolve_struct_field_load! already drilled the pointer to the
+                # exact load type via OpAccessChain (did_drill_for_load), ptr_id is
+                # already typed `_ptr_PhysicalStorageBuffer_<load_ty>` and needs no
+                # reinterpret — re-applying the ConvertPtrToU/ConvertUToPtr roundtrip
+                # to an OpAccessChain-to-scalar pointer makes MoltenVK emit
+                # `reinterpret_cast<ulong>(float)` (illegal in MSL). Only reinterpret
+                # when we did NOT drill, i.e. ptr_id still has the struct/base type.
                 ld_spirv_ty = map_type!(state.type_ctx, actual_load)
                 ld_ptr_ty = map_pointer_type!(state.type_ctx, ld_spirv_ty, SC.PhysicalStorageBuffer)
                 ptr_id = emit_psb_ptr_reinterpret!(state, ld_ptr_ty, ptr_id)
@@ -7336,10 +7387,10 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
     # SPIR-V atomic instructions require a pointer to the value type.
     # Byte-offset GEPs (gep i8) produce pointers-to-i8, but atomicrmw needs
     # a pointer to the actual value type (e.g., i32). Bitcast if needed.
+    sc = get_pointer_storage_class(ptr)
     ptr_pointee = get_pointee_type(state.type_ctx.ptm, ptr)
     if ptr_pointee !== nothing && ptr_pointee != result_llvm_ty
         # Need to reinterpret pointer to correct type
-        sc = get_pointer_storage_class(ptr)
         correct_ptr_ty = map_pointer_type!(state.type_ctx, result_ty, sc)
         if sc == SC.PhysicalStorageBuffer
             ptr_id = emit_psb_ptr_reinterpret!(state, correct_ptr_ty, ptr_id)
@@ -7349,6 +7400,16 @@ function emit_atomicrmw!(state::SPIRVEmitterState, inst::LLVM.AtomicRMWInst)
                 correct_ptr_ty, bitcast_id, ptr_id)
             ptr_id = bitcast_id
         end
+    end
+
+    # MoltenVK: an atomic on a raw PhysicalStorageBuffer pointer (built from BDA
+    # address arithmetic via OpConvertUToPtr) becomes illegal MSL — SPIRV-Cross
+    # emits `(device atomic_T*)&(reinterpret_cast<device T*>(addr))` and `&` on an
+    # rvalue is rejected. Route the pointer through a one-member Block struct +
+    # OpAccessChain so SPIRV-Cross sees an addressable lvalue. NVIDIA/AMD use the
+    # raw pointer unchanged (the wrapper is unnecessary and would only add ops).
+    if sc == SC.PhysicalStorageBuffer && is_moltenvk()
+        ptr_id = emit_psb_atomic_lvalue_ptr!(state, ptr_id, result_ty)
     end
 
     # Format: OpAtomic* result_type result_id pointer scope mem_semantics value
@@ -7393,9 +7454,9 @@ function emit_cmpxchg!(state::SPIRVEmitterState, inst::LLVM.AtomicCmpXchgInst)
     mem_sem_unequal_id = emit_constant_u32!(state.mod, atomic_mem_semantics_acquire_only(inst, ptr))
 
     # Reinterpret pointer if pointee type doesn't match value type (byte-offset GEPs)
+    sc = get_pointer_storage_class(ptr)
     ptr_pointee = get_pointee_type(state.type_ctx.ptm, ptr)
     if ptr_pointee !== nothing && ptr_pointee != val_llvm_ty
-        sc = get_pointer_storage_class(ptr)
         correct_ptr_ty = map_pointer_type!(state.type_ctx, val_ty, sc)
         if sc == SC.PhysicalStorageBuffer
             ptr_id = emit_psb_ptr_reinterpret!(state, correct_ptr_ty, ptr_id)
@@ -7405,6 +7466,12 @@ function emit_cmpxchg!(state::SPIRVEmitterState, inst::LLVM.AtomicCmpXchgInst)
                 correct_ptr_ty, bitcast_id, ptr_id)
             ptr_id = bitcast_id
         end
+    end
+
+    # MoltenVK: same addressable-lvalue workaround as emit_atomicrmw! — a CAS on a
+    # raw PSB pointer otherwise becomes `&(reinterpret_cast<...>)` (illegal MSL).
+    if sc == SC.PhysicalStorageBuffer && is_moltenvk()
+        ptr_id = emit_psb_atomic_lvalue_ptr!(state, ptr_id, val_ty)
     end
 
     # OpAtomicCompareExchange returns just the old value (not a struct like LLVM)
